@@ -25,6 +25,7 @@ _awacs_id_raw = os.getenv("AWACS_CHANNEL_ID")
 AWACS_CHANNEL_ID: int | None = int(_awacs_id_raw) if _awacs_id_raw else None
 
 TTS_VOICE = "en-GB-SoniaNeural"
+TTS_RATE = "+35%"
 SCAN_INTERVAL = 10  # seconds between automatic scans
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +114,33 @@ def _ocr_cell(img: Image.Image, x1: int, y1: int, x2: int, y2: int) -> str:
     return " ".join(words)
 
 
+GATE_LEFT = 83
+GATE_TOP = 135
+GATE_RIGHT = 136
+GATE_BOTTOM = 153
+
+
+def capture_gate_code() -> str:
+    """OCR the gate code region and return the first two alphanumeric chars + 'GATE'."""
+    monitor = {
+        "left": GATE_LEFT,
+        "top": GATE_TOP,
+        "width": GATE_RIGHT - GATE_LEFT,
+        "height": GATE_BOTTOM - GATE_TOP,
+    }
+    with mss.mss() as sct:
+        screenshot = sct.grab(monitor)
+        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+
+    img = img.resize((img.width * 4, img.height * 4), Image.LANCZOS)
+    raw = pytesseract.image_to_string(img, config="--psm 7").strip()
+
+    alphanumeric = re.sub(r"[^A-Za-z0-9]", "", raw)
+    if len(alphanumeric) >= 2:
+        return f"{alphanumeric[:2].upper()} GATE"
+    return ""
+
+
 def capture_ship_table() -> list[dict]:
     """Screenshot the overview area and OCR each row's columns."""
     monitor = {
@@ -175,43 +203,48 @@ def _parse_velocity(raw: str) -> str:
 
 
 def _speed_category(raw: str) -> str:
-    """Return 'hot' if velocity > 300 m/s, otherwise 'cold'."""
+    """Return 'hot' (>300 m/s), 'cold' (10-300), or 'static' (<10)."""
     nums = re.findall(r"[\d.]+", raw)
     if not nums:
-        return "cold"
+        return "static"
     try:
-        return "hot" if float(nums[0]) > 300 else "cold"
+        v = float(nums[0])
     except ValueError:
-        return "cold"
+        return "static"
+    if v < 10:
+        return "static"
+    return "hot" if v > 300 else "cold"
 
 
-def format_popup_announcement(new_ships: list[dict]) -> str:
+def format_popup_announcement(new_ships: list[dict], gate: str = "") -> str:
     """Build the AWACS pop-up call for newly detected contacts."""
     parts = []
     for s in new_ships:
         name = s["ship_type"]
-        dist = _parse_distance(s["distance"])
         speed = _speed_category(s["velocity"])
-        parts.append(
-            f"SATAN 1, Magic, Pop-up group, {name}, {dist}, {speed}"
-        )
+        line = f"SATAN 1, Magic, Pop-up group, {name}, {speed}"
+        if gate:
+            line += f", {gate}"
+        parts.append(line)
     return ". ".join(parts)
 
 
-def format_announcement(ships: list[dict]) -> str:
+def format_announcement(ships: list[dict], gate: str = "") -> str:
     """Build a TTS-friendly string from the ship table."""
     parts = []
     for s in ships:
         name = s["ship_type"]
-        dist = _parse_distance(s["distance"])
-        vel = _parse_velocity(s["velocity"])
-        parts.append(f"{name}, {dist}, {vel}")
+        speed = _speed_category(s["velocity"])
+        line = f"{name}, {speed}"
+        if gate:
+            line += f", {gate}"
+        parts.append(line)
     return ". ".join(parts)
 
 
 async def generate_tts(text: str) -> str:
     path = os.path.join(TEMP_DIR, "tts_output.mp3")
-    communicate = edge_tts.Communicate(text, TTS_VOICE)
+    communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
     await communicate.save(path)
     return path
 
@@ -318,7 +351,8 @@ async def announce_ships(vc: discord.VoiceClient) -> bool:
     for s in ships:
         print(f"  {s['ship_type']:>20s}  |  {s['distance']:>10s}  |  {s['velocity']:>6s}")
 
-    announcement = format_announcement(ships)
+    gate = capture_gate_code()
+    announcement = format_announcement(ships, gate)
     print(f"[TTS] {announcement}")
     await voice_say(vc, announcement)
     print("[TTS] Done.")
@@ -361,7 +395,8 @@ async def popup_scan_loop():
 
                 vc = await ensure_connected()
                 if vc:
-                    text = format_popup_announcement(new_ships)
+                    gate = capture_gate_code()
+                    text = format_popup_announcement(new_ships, gate)
                     print(f"[POPUP TTS] {text}")
                     await voice_say(vc, text)
 
