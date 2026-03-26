@@ -9,14 +9,20 @@ import mss
 import pytesseract
 from PIL import Image
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
+try:
     from dotenv import load_dotenv
+
     load_dotenv()
-    TOKEN = os.getenv("BOT_TOKEN")
+except ImportError:
+    pass
+
+TOKEN = os.getenv("BOT_TOKEN")
 GUILD_ID = 143166145350860800
 VOICE_CHANNEL_ID = 388138351238316035
 COMMAND_CHANNEL_ID = 1147970850260254740
+# Optional: set in .env to force a channel. Otherwise the bot uses a text channel named "awacs" in GUILD_ID.
+_awacs_id_raw = os.getenv("AWACS_CHANNEL_ID")
+AWACS_CHANNEL_ID: int | None = int(_awacs_id_raw) if _awacs_id_raw else None
 
 TTS_VOICE = "en-GB-SoniaNeural"
 SCAN_INTERVAL = 10  # seconds between automatic scans
@@ -70,6 +76,7 @@ _prev_ship_count = 0
 POPUP_SCAN_INTERVAL = 3  # seconds between popup-mode scans
 
 _last_toggle = 0.0
+_awacs_missing_logged = False
 
 
 MIN_CONFIDENCE = 50       # tesseract confidence threshold (0-100)
@@ -209,6 +216,50 @@ async def generate_tts(text: str) -> str:
     return path
 
 
+def _split_discord_chunks(text: str, limit: int = 2000) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    return [text[i : i + limit] for i in range(0, len(text), limit)]
+
+
+def _resolve_awacs_channel() -> discord.TextChannel | None:
+    global _awacs_missing_logged
+    if AWACS_CHANNEL_ID is not None:
+        ch = client.get_channel(AWACS_CHANNEL_ID)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    guild = client.get_guild(GUILD_ID)
+    if guild:
+        found = discord.utils.get(guild.text_channels, name="awacs")
+        if isinstance(found, discord.TextChannel):
+            return found
+    if not _awacs_missing_logged:
+        print(
+            "[AWACS] No AWACS text channel (set AWACS_CHANNEL_ID in .env or create #awacs)."
+        )
+        _awacs_missing_logged = True
+    return None
+
+
+async def post_awacs_text(text: str) -> None:
+    """Mirror spoken TTS lines into the AWACS text channel."""
+    ch = _resolve_awacs_channel()
+    if ch is None:
+        return
+    try:
+        for chunk in _split_discord_chunks(text):
+            await ch.send(chunk)
+    except discord.HTTPException as e:
+        print(f"[AWACS] Failed to send message: {e}")
+
+
+async def voice_say(vc: discord.VoiceClient, text: str) -> None:
+    """Post text to #awacs, then TTS and play in voice."""
+    await post_awacs_text(text)
+    tts_path = await generate_tts(text)
+    await play_file(vc, tts_path)
+
+
 async def play_file(vc: discord.VoiceClient, path: str):
     if vc.is_playing():
         vc.stop()
@@ -269,9 +320,7 @@ async def announce_ships(vc: discord.VoiceClient) -> bool:
 
     announcement = format_announcement(ships)
     print(f"[TTS] {announcement}")
-    tts_path = await generate_tts(announcement)
-
-    await play_file(vc, tts_path)
+    await voice_say(vc, announcement)
     print("[TTS] Done.")
     return True
 
@@ -314,8 +363,7 @@ async def popup_scan_loop():
                 if vc:
                     text = format_popup_announcement(new_ships)
                     print(f"[POPUP TTS] {text}")
-                    tts_path = await generate_tts(text)
-                    await play_file(vc, tts_path)
+                    await voice_say(vc, text)
 
             _prev_ship_count = current_count
         except asyncio.CancelledError:
@@ -325,8 +373,12 @@ async def popup_scan_loop():
         await asyncio.sleep(POPUP_SCAN_INTERVAL)
 
 
-async def bogey_dope():
-    """One-shot scan. Joins voice if not already connected."""
+async def bogey_dope() -> str:
+    """One-shot scan. Joins voice if not already connected.
+
+    Returns a short outcome token for command-channel replies:
+    ``voice_failed``, ``clean``, or ``contacts``.
+    """
     global active
     if not active:
         active = True
@@ -334,12 +386,13 @@ async def bogey_dope():
     if vc is None:
         print("[BOGEY DOPE] Could not connect to voice.")
         active = False
-        return
+        return "voice_failed"
     found = await announce_ships(vc)
     if not found:
         print("[BOGEY DOPE] Clean -- announcing.")
-        tts_path = await generate_tts("SATAN 1, Magic, picture Clean.")
-        await play_file(vc, tts_path)
+        await voice_say(vc, "SATAN 1, Magic, picture Clean.")
+        return "clean"
+    return "contacts"
 
 
 async def toggle_voice():
@@ -393,8 +446,7 @@ async def declare_popup():
         return
 
     print(f"[POPUP] Popup mode ON. Scanning every {POPUP_SCAN_INTERVAL}s for new contacts...")
-    tts_path = await generate_tts("Magic, popup mode active.")
-    await play_file(vc, tts_path)
+    await voice_say(vc, "Magic, popup mode active.")
     popup_task = asyncio.create_task(popup_scan_loop())
 
 
@@ -436,6 +488,7 @@ async def on_ready():
     print(f"  Overview region: ({OVERVIEW_LEFT},{OVERVIEW_TOP}) -> ({OVERVIEW_RIGHT},{OVERVIEW_BOTTOM})")
     print(f"  Max rows: {MAX_ROWS}, row height: {ROW_HEIGHT}px")
     print(f"  TTS voice: {TTS_VOICE}")
+    print("  Spoken lines are also posted to #awacs (or AWACS_CHANNEL_ID).")
     print()
 
     keyboard.add_hotkey("ctrl+shift+w", _schedule_debounced_toggle)
@@ -454,23 +507,60 @@ async def on_message(message: discord.Message):
     if text == "scan":
         status = "Deactivating" if active else "Activating"
         print(f"[CMD] '{message.author}' said 'scan' -- {status}...")
+        await message.reply("Copy — processing **scan**…")
+        was_active = active
         await toggle_voice()
+        if was_active:
+            await message.reply("Roger — **scan off.** Disconnected from voice.")
+        elif active:
+            await message.reply(
+                f"Roger — **scan on.** Announcing every **{SCAN_INTERVAL}** seconds."
+            )
+        else:
+            await message.reply(
+                "Negative — could not join voice. Check the bot / channel permissions."
+            )
 
     elif text == "bogey dope":
         print(f"[CMD] '{message.author}' said 'bogey dope' -- one-shot scan...")
-        await bogey_dope()
+        await message.reply("Copy — **bogey dope**, running one-shot scan…")
+        outcome = await bogey_dope()
+        if outcome == "voice_failed":
+            await message.reply(
+                "Negative — could not join voice. Bogey dope aborted."
+            )
+        elif outcome == "clean":
+            await message.reply("Bogey dope complete — **clean.** Picture call sent.")
+        else:
+            await message.reply(
+                "Bogey dope complete — **contacts** read out (see #awacs)."
+            )
 
     elif text == "declare popup":
         status = "Deactivating" if popup_mode else "Activating"
         print(f"[CMD] '{message.author}' said 'declare popup' -- {status} popup mode...")
+        await message.reply("Copy — processing **declare popup**…")
+        was_popup = popup_mode
         await declare_popup()
+        if was_popup:
+            await message.reply("Roger — **popup mode off.**")
+        elif popup_mode:
+            await message.reply(
+                f"Roger — **popup mode on.** Checking every **{POPUP_SCAN_INTERVAL}**s for new contacts."
+            )
+        else:
+            await message.reply(
+                "Negative — could not join voice. Popup mode not started."
+            )
 
     elif text == "cancel popup":
         if popup_mode:
             print(f"[CMD] '{message.author}' said 'cancel popup' -- stopping...")
             await declare_popup()
+            await message.reply("Roger — **popup cancelled.**")
         else:
             print("[CMD] 'cancel popup' received but popup mode not active.")
+            await message.reply("Negative — popup mode was **not** active.")
 
 
 client.run(TOKEN)
