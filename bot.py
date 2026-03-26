@@ -63,6 +63,12 @@ voice_client: discord.VoiceClient | None = None
 scan_task: asyncio.Task | None = None
 active = False
 
+popup_mode = False
+popup_task: asyncio.Task | None = None
+_prev_ship_count = 0
+
+POPUP_SCAN_INTERVAL = 3  # seconds between popup-mode scans
+
 _last_toggle = 0.0
 
 
@@ -159,6 +165,30 @@ def _parse_velocity(raw: str) -> str:
     if val == "0":
         return "stationary"
     return f"{val} meters per second"
+
+
+def _speed_category(raw: str) -> str:
+    """Return 'hot' if velocity > 300 m/s, otherwise 'cold'."""
+    nums = re.findall(r"[\d.]+", raw)
+    if not nums:
+        return "cold"
+    try:
+        return "hot" if float(nums[0]) > 300 else "cold"
+    except ValueError:
+        return "cold"
+
+
+def format_popup_announcement(new_ships: list[dict]) -> str:
+    """Build the AWACS pop-up call for newly detected contacts."""
+    parts = []
+    for s in new_ships:
+        name = s["ship_type"]
+        dist = _parse_distance(s["distance"])
+        speed = _speed_category(s["velocity"])
+        parts.append(
+            f"SATAN 1, Magic, Pop-up group, {name}, {dist}, {speed}"
+        )
+    return ". ".join(parts)
 
 
 def format_announcement(ships: list[dict]) -> str:
@@ -261,6 +291,40 @@ async def scan_loop():
         await asyncio.sleep(SCAN_INTERVAL)
 
 
+async def popup_scan_loop():
+    """Background loop: watch for ship count increases and announce pop-ups."""
+    global _prev_ship_count
+    await asyncio.sleep(1.0)
+
+    _prev_ship_count = len(capture_ship_table())
+    print(f"[POPUP] Baseline: {_prev_ship_count} contact(s)")
+
+    while popup_mode:
+        try:
+            ships = capture_ship_table()
+            current_count = len(ships)
+
+            if current_count > _prev_ship_count:
+                new_ships = ships[_prev_ship_count:]
+                print(f"[POPUP] +{len(new_ships)} new contact(s) detected!")
+                for s in new_ships:
+                    print(f"  {s['ship_type']:>20s}  |  {s['distance']:>10s}  |  {s['velocity']:>6s}")
+
+                vc = await ensure_connected()
+                if vc:
+                    text = format_popup_announcement(new_ships)
+                    print(f"[POPUP TTS] {text}")
+                    tts_path = await generate_tts(text)
+                    await play_file(vc, tts_path)
+
+            _prev_ship_count = current_count
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[POPUP LOOP] Error: {e}")
+        await asyncio.sleep(POPUP_SCAN_INTERVAL)
+
+
 async def bogey_dope():
     """One-shot scan. Joins voice if not already connected."""
     global active
@@ -274,7 +338,7 @@ async def bogey_dope():
     found = await announce_ships(vc)
     if not found:
         print("[BOGEY DOPE] Clean -- announcing.")
-        tts_path = await generate_tts("SATAN 1, Magic, Clean.")
+        tts_path = await generate_tts("SATAN 1, Magic, picture Clean.")
         await play_file(vc, tts_path)
 
 
@@ -307,6 +371,33 @@ async def toggle_voice():
     scan_task = asyncio.create_task(scan_loop())
 
 
+async def declare_popup():
+    """Toggle popup awareness mode on/off."""
+    global popup_mode, popup_task, _prev_ship_count
+
+    if popup_mode:
+        print("[POPUP] Deactivating popup mode...")
+        popup_mode = False
+        if popup_task and not popup_task.done():
+            popup_task.cancel()
+            popup_task = None
+        _prev_ship_count = 0
+        print("[POPUP] Popup mode off.")
+        return
+
+    popup_mode = True
+    vc = await ensure_connected()
+    if vc is None:
+        print("[POPUP] Could not connect to voice.")
+        popup_mode = False
+        return
+
+    print(f"[POPUP] Popup mode ON. Scanning every {POPUP_SCAN_INTERVAL}s for new contacts...")
+    tts_path = await generate_tts("Magic, popup mode active.")
+    await play_file(vc, tts_path)
+    popup_task = asyncio.create_task(popup_scan_loop())
+
+
 async def test_beep():
     vc = await ensure_connected()
     if vc is None:
@@ -337,8 +428,10 @@ async def on_ready():
     print("  Ctrl+Shift+W  ->  Toggle scan loop (every {0}s)".format(SCAN_INTERVAL))
     print("  Ctrl+Shift+T  ->  Play test beep")
     print()
-    print(f'  "scan"        ->  Toggle scan loop  (in #{COMMAND_CHANNEL_ID})')
-    print(f'  "bogey dope"  ->  One-shot scan     (in #{COMMAND_CHANNEL_ID})')
+    print(f'  "scan"            ->  Toggle scan loop       (in #{COMMAND_CHANNEL_ID})')
+    print(f'  "bogey dope"      ->  One-shot scan          (in #{COMMAND_CHANNEL_ID})')
+    print(f'  "declare popup"   ->  Toggle popup awareness (in #{COMMAND_CHANNEL_ID})')
+    print(f'  "cancel popup"    ->  Stop popup mode        (in #{COMMAND_CHANNEL_ID})')
     print()
     print(f"  Overview region: ({OVERVIEW_LEFT},{OVERVIEW_TOP}) -> ({OVERVIEW_RIGHT},{OVERVIEW_BOTTOM})")
     print(f"  Max rows: {MAX_ROWS}, row height: {ROW_HEIGHT}px")
@@ -366,6 +459,18 @@ async def on_message(message: discord.Message):
     elif text == "bogey dope":
         print(f"[CMD] '{message.author}' said 'bogey dope' -- one-shot scan...")
         await bogey_dope()
+
+    elif text == "declare popup":
+        status = "Deactivating" if popup_mode else "Activating"
+        print(f"[CMD] '{message.author}' said 'declare popup' -- {status} popup mode...")
+        await declare_popup()
+
+    elif text == "cancel popup":
+        if popup_mode:
+            print(f"[CMD] '{message.author}' said 'cancel popup' -- stopping...")
+            await declare_popup()
+        else:
+            print("[CMD] 'cancel popup' received but popup mode not active.")
 
 
 client.run(TOKEN)
